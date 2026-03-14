@@ -1,0 +1,60 @@
+import type { ChatCompletionRequest } from "../providers/openaiSchemas.js";
+
+const normalizeContent = (value: string): string => value.replace(/\r\n/g, "\n").trim();
+
+type BuildPromptOptions = {
+  maxConversationMessages: number;
+  maxMessageChars: number;
+  maxPromptChars: number;
+};
+
+const trimMessage = (value: string, maxChars: number): string => {
+  const normalized = normalizeContent(value);
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  const tail = normalized.slice(normalized.length - maxChars);
+  return `[truncated]\n${tail}`;
+};
+
+const trimPrompt = (prompt: string, maxChars: number): string => {
+  if (prompt.length <= maxChars) {
+    return prompt;
+  }
+
+  const tail = prompt.slice(prompt.length - maxChars);
+  return `[prompt truncated to last ${maxChars} chars]\n${tail}`;
+};
+
+export const buildCursorPrompt = (
+  request: ChatCompletionRequest,
+  options: BuildPromptOptions
+): string => {
+  const systemMessages = request.messages.filter((message) => message.role === "system");
+  const latestSystem = systemMessages.at(-1);
+  const conversationMessages = request.messages
+    .filter((message) => message.role !== "system")
+    .slice(-options.maxConversationMessages);
+
+  const systemSection = (latestSystem ? [latestSystem] : [])
+    .map((message) => trimMessage(message.content, options.maxMessageChars))
+    .filter(Boolean)
+    .join("\n\n");
+
+  const conversationSection = conversationMessages
+    .map((message) => `${message.role}: ${trimMessage(message.content, options.maxMessageChars)}`)
+    .join("\n");
+
+  const prompt = [
+    "[SYSTEM]",
+    "You are being called through an adapter from OpenCode.",
+    "Return only the final assistant response with no surrounding metadata.",
+    systemSection || "(no explicit system message)",
+    "",
+    "[CONVERSATION]",
+    conversationSection
+  ].join("\n");
+
+  return trimPrompt(prompt, options.maxPromptChars);
+};
