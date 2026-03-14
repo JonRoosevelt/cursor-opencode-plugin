@@ -22,7 +22,14 @@ Local adapter that exposes Cursor Agent CLI as an OpenAI-style chat completion e
 ## Requirements
 
 - Node.js `>=20`
+- Cursor Agent CLI installed locally (`cursor-agent`)
 - Local Cursor Agent binary path configured in `CURSOR_BIN_PATH`
+
+Verify Cursor Agent is installed:
+
+```bash
+cursor-agent --version
+```
 
 ## Setup
 
