@@ -89,9 +89,36 @@ Configure OpenCode to use this local endpoint as an OpenAI-compatible provider:
 - Model: `cursor-agent/default`
 - API key: any dummy value if OpenCode requires one
 
+Create or update `~/.config/opencode/opencode.json` with a `cursor` provider entry like:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "cursor": {
+      "name": "Cursor",
+      "npm": "@ai-sdk/openai-compatible",
+      "models": {
+        "claude-4-6-sonnet": {
+          "name": "Claude Sonnet 4.6"
+        },
+        "gpt-5.3-codex": {
+          "name": "GPT-5.3 Codex"
+        }
+      },
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1"
+      }
+    }
+  }
+}
+```
+
 ## Current assumptions
 
 - Cursor CLI is callable as a local binary and can run headlessly.
+- True token-level streaming is not available in `v0.1.0` due to current `cursor-agent` behavior.
+- When `stream=true`, the adapter returns SSE-shaped output after Cursor finishes (pseudo-stream), not live token deltas.
 - Prompt delivery mode may differ by Cursor version; use:
   - `CURSOR_PROMPT_MODE=stdin` (default), or
   - `CURSOR_PROMPT_MODE=arg` with `CURSOR_PROMPT_ARG`.
