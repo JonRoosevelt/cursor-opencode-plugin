@@ -1,5 +1,9 @@
 # Cursor OpenCode Adapter (MVP)
 
+[![Release](https://img.shields.io/github/v/release/JonRoosevelt/cursor-opencode-plugin?display_name=tag)](https://github.com/JonRoosevelt/cursor-opencode-plugin/releases)
+![Node >=20](https://img.shields.io/badge/node-%3E%3D20-339933)
+![Status MVP](https://img.shields.io/badge/status-MVP-4c1)
+
 Local adapter that exposes Cursor Agent CLI as an OpenAI-style chat completion endpoint so OpenCode can call it as if it were a model provider.
 
 ## What this ships
