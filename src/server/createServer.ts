@@ -218,6 +218,13 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       body = chatCompletionRequestSchema.parse(request.body);
     } catch (error: unknown) {
       if (error instanceof ZodError) {
+        request.log.error(
+          {
+            rawBody: request.body,
+            issues: error.issues
+          },
+          "request body validation failed"
+        );
         throw new AdapterError("INVALID_REQUEST", "Request body validation failed.", 400, {
           issues: error.issues
         });
@@ -314,6 +321,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
     );
 
     let resumeChatId: string | undefined;
+    let sessionChatIdToPersist: string | null = null;
     if (sessionKey) {
       const existingChatId = sessionStore.get(sessionKey);
       if (existingChatId) {
@@ -321,15 +329,14 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       }
 
       if (!resumeChatId) {
-        const createdChatId = await createCursorChat(config, cwd);
-        sessionStore.set(sessionKey, createdChatId);
-        resumeChatId = createdChatId;
+        resumeChatId = await createCursorChat(config, cwd);
+        sessionChatIdToPersist = resumeChatId;
       }
     }
 
     if (body.stream) {
       const completionId = `chatcmpl-${randomUUID()}`;
-      const streamState = createStreamJsonState();
+      let streamState = createStreamJsonState();
       const assistantParts: string[] = [];
 
       reply.hijack();
@@ -376,31 +383,54 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
         if (canRetryWithFreshSession && sessionKey) {
           sessionStore.delete(sessionKey);
           const freshChatId = await createCursorChat(config, cwd);
-          sessionStore.set(sessionKey, freshChatId);
+          // A failed first attempt can leave trailing bytes in the parser buffer.
+          // Start the retry with a fresh parser state to avoid corrupting first chunks.
+          streamState = createStreamJsonState();
+          assistantParts.length = 0;
+          try {
+            streamResult = await runCursor({
+              prompt: flattenedPrompt,
+              cwd,
+              config,
+              resumeChatId: freshChatId,
+              streamJsonOutput: true,
+              onStdoutChunk: (chunk) => {
+                const assistantChunks = consumeStreamJsonChunk(streamState, chunk);
+                if (assistantChunks.length === 0) {
+                  return;
+                }
 
-          streamResult = await runCursor({
-            prompt: flattenedPrompt,
-            cwd,
-            config,
-            resumeChatId: freshChatId,
-            streamJsonOutput: true,
-            onStdoutChunk: (chunk) => {
-              const assistantChunks = consumeStreamJsonChunk(streamState, chunk);
-              if (assistantChunks.length === 0) {
-                return;
+                for (const assistantChunk of assistantChunks) {
+                  assistantParts.push(assistantChunk);
+                  writeSsePayload(
+                    reply.raw,
+                    makeStreamChunk(completionId, body.model, { content: assistantChunk }, null)
+                  );
+                }
               }
-
-              for (const assistantChunk of assistantChunks) {
-                assistantParts.push(assistantChunk);
-                writeSsePayload(
-                  reply.raw,
-                  makeStreamChunk(completionId, body.model, { content: assistantChunk }, null)
-                );
+            });
+            resumeChatId = freshChatId;
+            sessionChatIdToPersist = freshChatId;
+          } catch (retryError: unknown) {
+            const retryAdapterError = asAdapterError(retryError);
+            request.log.error(
+              {
+                code: retryAdapterError.code,
+                statusCode: retryAdapterError.statusCode,
+                details: retryAdapterError.details
+              },
+              "cursor streamed retry with fresh session failed"
+            );
+            writeSsePayload(reply.raw, {
+              error: {
+                code: retryAdapterError.code,
+                message: retryAdapterError.message
               }
-            }
-          });
-
-          resumeChatId = freshChatId;
+            });
+            reply.raw.write("data: [DONE]\n\n");
+            reply.raw.end();
+            return;
+          }
         } else {
           request.log.error(
             {
@@ -451,6 +481,9 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       }
 
       const assistantText = assistantParts.join("");
+      if (sessionKey && sessionChatIdToPersist) {
+        sessionStore.set(sessionKey, sessionChatIdToPersist);
+      }
       if (config.responseCacheTtlMs > 0) {
         if (responseCache.size >= config.responseCacheMaxEntries) {
           const firstKey = responseCache.keys().next().value;
@@ -503,16 +536,20 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
 
       sessionStore.delete(sessionKey);
       const freshChatId = await createCursorChat(config, cwd);
-      sessionStore.set(sessionKey, freshChatId);
       cursorResult = await runCursor({
         prompt: flattenedPrompt,
         cwd,
         config,
         resumeChatId: freshChatId
       });
+      resumeChatId = freshChatId;
+      sessionChatIdToPersist = freshChatId;
     }
 
     const assistantText = parseCursorOutput(cursorResult.stdout, cursorResult.stderr);
+    if (sessionKey && sessionChatIdToPersist) {
+      sessionStore.set(sessionKey, sessionChatIdToPersist);
+    }
     if (config.responseCacheTtlMs > 0) {
       if (responseCache.size >= config.responseCacheMaxEntries) {
         const firstKey = responseCache.keys().next().value;

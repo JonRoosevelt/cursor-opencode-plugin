@@ -391,4 +391,235 @@ describe("adapter server", () => {
 
     await server.close();
   });
+
+  it("does not persist a fresh session id when non-stream retry also fails", async () => {
+    spawnMock
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toEqual(["create-chat"]);
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "11111111-1111-4111-8111-111111111111\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toContain("--resume");
+        expect(args).toContain("11111111-1111-4111-8111-111111111111");
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stderr.emit("data", "first run failed");
+          child.emit("close", 2);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toEqual(["create-chat"]);
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "22222222-2222-4222-8222-222222222222\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toContain("--resume");
+        expect(args).toContain("22222222-2222-4222-8222-222222222222");
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stderr.emit("data", "retry failed");
+          child.emit("close", 2);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toEqual(["create-chat"]);
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "33333333-3333-4333-8333-333333333333\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toContain("--resume");
+        expect(args).toContain("33333333-3333-4333-8333-333333333333");
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "session recovered");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        responseCacheTtlMs: 0,
+        enableCursorSessions: true,
+        cursorSessionFallbackToCwd: false
+      }
+    });
+
+    const payload = {
+      model: "claude-4-6-sonnet",
+      messages: [{ role: "user", content: "session recovery" }],
+      stream: false,
+      metadata: {
+        conversationId: "conv-retry"
+      }
+    };
+
+    const first = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload
+    });
+    expect(first.statusCode).toBe(502);
+    expect(first.json().error.code).toBe("CURSOR_NON_ZERO_EXIT");
+
+    const second = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().choices[0].message.content).toBe("session recovered");
+    expect(spawnMock).toHaveBeenCalledTimes(6);
+
+    await server.close();
+  });
+
+  it("retries streaming with a fresh parser state when first attempt ends mid-line", async () => {
+    spawnMock
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "11111111-1111-4111-8111-111111111111\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", '{"choices":[{"delta":{"content":"half');
+          child.stderr.emit("data", "first stream failed");
+          child.emit("close", 2);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "22222222-2222-4222-8222-222222222222\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, args: string[]) => {
+        expect(args).toContain("--output-format");
+        expect(args).toContain("stream-json");
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", '{"choices":[{"delta":{"content":"hello "}}]}\n');
+          child.stdout.emit("data", '{"choices":[{"delta":{"content":"world"}}]}\n');
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        responseCacheTtlMs: 0,
+        enableCursorSessions: true,
+        cursorSessionFallbackToCwd: false
+      }
+    });
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        model: "claude-4-6-sonnet",
+        messages: [{ role: "user", content: "stream retry test" }],
+        stream: true,
+        metadata: {
+          conversationId: "conv-stream-buffer"
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('"content":"hello "');
+    expect(response.body).toContain('"content":"world"');
+    expect(response.body).toContain("data: [DONE]");
+
+    await server.close();
+  });
+
+  it("emits SSE error and done when streaming retry with fresh session fails", async () => {
+    spawnMock
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "11111111-1111-4111-8111-111111111111\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stderr.emit("data", "first stream failed");
+          child.emit("close", 2);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "22222222-2222-4222-8222-222222222222\n");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce(() => {
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stderr.emit("data", "retry stream failed");
+          child.emit("close", 2);
+        }, 0);
+        return child;
+      });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        responseCacheTtlMs: 0,
+        enableCursorSessions: true,
+        cursorSessionFallbackToCwd: false
+      }
+    });
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        model: "claude-4-6-sonnet",
+        messages: [{ role: "user", content: "stream retry fail test" }],
+        stream: true,
+        metadata: {
+          conversationId: "conv-stream-fail"
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('"error":{"code":"CURSOR_NON_ZERO_EXIT"');
+    expect(response.body).toContain("data: [DONE]");
+
+    await server.close();
+  });
 });
