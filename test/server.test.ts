@@ -33,6 +33,10 @@ const baseConfig: AppConfig = {
   modelId: "cursor-agent/default",
   modelAliases: ["cursor-agent/default", "claude-4-6-sonnet"],
   acceptAnyModel: true,
+  cursorModelArg: "--model",
+  cursorDiscoverModels: false,
+  cursorModelsArgs: ["models", "--output", "json"],
+  cursorModelsCacheTtlMs: 300_000,
   cursorPromptMode: "stdin",
   cursorPromptArg: "--prompt",
   cursorBaseArgs: [],
@@ -65,6 +69,57 @@ describe("adapter server", () => {
     vi.useRealTimers();
   });
 
+  it("serves discovered models on both /models and /v1/models", async () => {
+    spawnMock.mockImplementationOnce((_bin: string, args: string[]) => {
+      expect(args).toEqual(["models", "--output", "json"]);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit(
+          "data",
+          JSON.stringify({
+            data: [{ id: "claude-4-6-sonnet" }, { id: "gpt-5.3-codex" }]
+          })
+        );
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        acceptAnyModel: false,
+        cursorDiscoverModels: true,
+        responseCacheTtlMs: 0
+      }
+    });
+
+    const modelsResponse = await server.inject({
+      method: "GET",
+      url: "/models"
+    });
+    expect(modelsResponse.statusCode).toBe(200);
+    expect(modelsResponse.json().data.map((entry: { id: string }) => entry.id)).toEqual([
+      "claude-4-6-sonnet",
+      "gpt-5.3-codex",
+      "cursor-agent/default"
+    ]);
+
+    const v1ModelsResponse = await server.inject({
+      method: "GET",
+      url: "/v1/models"
+    });
+    expect(v1ModelsResponse.statusCode).toBe(200);
+    expect(v1ModelsResponse.json().data.map((entry: { id: string }) => entry.id)).toEqual([
+      "claude-4-6-sonnet",
+      "gpt-5.3-codex",
+      "cursor-agent/default"
+    ]);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    await server.close();
+  });
+
   it("returns normalized assistant message for successful run", async () => {
     spawnMock.mockImplementationOnce(() => {
       const child = new MockChildProcess();
@@ -85,6 +140,105 @@ describe("adapter server", () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.choices[0].message.content).toBe("hello from cursor");
+
+    await server.close();
+  });
+
+  it("passes request model to cursor-agent invocation", async () => {
+    spawnMock.mockImplementationOnce((_bin: string, args: string[]) => {
+      expect(args).toContain("--model");
+      expect(args).toContain("claude-4-6-sonnet");
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "model passthrough works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        model: "claude-4-6-sonnet"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("model passthrough works");
+
+    await server.close();
+  });
+
+  it("returns discovered cursor-agent models from /v1/models", async () => {
+    spawnMock.mockImplementationOnce((_bin: string, args: string[]) => {
+      expect(args).toEqual(["models", "--output", "json"]);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit(
+          "data",
+          JSON.stringify({
+            models: [{ id: "gpt-5.3-codex" }, { id: "claude-4-6-sonnet" }]
+          })
+        );
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        cursorDiscoverModels: true
+      }
+    });
+
+    const response = await server.inject({
+      method: "GET",
+      url: "/v1/models"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const modelIds = response
+      .json()
+      .data.map((model: { id: string }) => model.id);
+    expect(modelIds).toContain("gpt-5.3-codex");
+    expect(modelIds).toContain("claude-4-6-sonnet");
+    expect(modelIds).toContain("cursor-agent/default");
+
+    await server.close();
+  });
+
+  it("falls back to configured aliases when model discovery fails", async () => {
+    spawnMock.mockImplementationOnce(() => {
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stderr.emit("data", "unknown command: models");
+        child.emit("close", 2);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        cursorDiscoverModels: true
+      }
+    });
+
+    const response = await server.inject({
+      method: "GET",
+      url: "/v1/models"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const modelIds = response
+      .json()
+      .data.map((model: { id: string }) => model.id);
+    expect(modelIds).toContain("cursor-agent/default");
+    expect(modelIds).toContain("claude-4-6-sonnet");
 
     await server.close();
   });

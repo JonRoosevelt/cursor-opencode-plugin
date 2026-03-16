@@ -8,6 +8,7 @@ type RunCursorInput = {
   prompt: string;
   cwd: string;
   config: AppConfig;
+  model?: string;
   resumeChatId?: string;
   streamJsonOutput?: boolean;
   onStdoutChunk?: (chunk: string) => void;
@@ -35,6 +36,7 @@ export const runCursor = ({
   prompt,
   cwd,
   config,
+  model,
   resumeChatId,
   streamJsonOutput,
   onStdoutChunk,
@@ -44,6 +46,10 @@ export const runCursor = ({
     const requestId = randomUUID();
     const startedAt = Date.now();
     const args = [...config.cursorBaseArgs];
+
+    if (model) {
+      args.push(config.cursorModelArg, model);
+    }
 
     if (resumeChatId) {
       args.push("--resume", resumeChatId);

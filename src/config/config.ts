@@ -15,6 +15,10 @@ export type AppConfig = {
   modelId: string;
   modelAliases: string[];
   acceptAnyModel: boolean;
+  cursorModelArg: string;
+  cursorDiscoverModels: boolean;
+  cursorModelsArgs: string[];
+  cursorModelsCacheTtlMs: number;
   cursorPromptMode: PromptMode;
   cursorPromptArg: string;
   cursorBaseArgs: string[];
@@ -122,6 +126,10 @@ export const loadConfig = (): AppConfig => {
     modelId,
     modelAliases: parseAliases(process.env.CURSOR_MODEL_ALIASES, modelId),
     acceptAnyModel: parseBoolean(process.env.CURSOR_ACCEPT_ANY_MODEL, true),
+    cursorModelArg: process.env.CURSOR_MODEL_ARG ?? "--model",
+    cursorDiscoverModels: parseBoolean(process.env.CURSOR_DISCOVER_MODELS, true),
+    cursorModelsArgs: parseArgs(process.env.CURSOR_MODELS_ARGS ?? "models"),
+    cursorModelsCacheTtlMs: parseInteger(process.env.CURSOR_MODELS_CACHE_TTL_MS, 300_000),
     cursorPromptMode: promptMode,
     cursorPromptArg: process.env.CURSOR_PROMPT_ARG ?? "--prompt",
     cursorBaseArgs: parseArgs(process.env.CURSOR_BASE_ARGS),

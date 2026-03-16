@@ -3,14 +3,40 @@ import { resolveSkillCommand } from "./resolveSkillCommand.js";
 
 const normalizeContent = (value: string): string => value.replace(/\r\n/g, "\n").trim();
 
+const messageToText = (content: ChatCompletionRequest["messages"][number]["content"]): string => {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+
+        if (part && typeof part === "object" && "text" in part && typeof part.text === "string") {
+          return part.text;
+        }
+
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return "";
+};
+
 type BuildPromptOptions = {
   maxConversationMessages: number;
   maxMessageChars: number;
   maxPromptChars: number;
 };
 
-const trimMessage = (value: string, maxChars: number): string => {
-  const normalized = normalizeContent(value);
+const trimMessage = (content: ChatCompletionRequest["messages"][number]["content"], maxChars: number): string => {
+  const text = messageToText(content);
+  const normalized = normalizeContent(text);
   if (normalized.length <= maxChars) {
     return normalized;
   }
@@ -39,19 +65,19 @@ export const buildCursorPrompt = (
     .slice(-options.maxConversationMessages);
 
   const systemSection = (latestSystem ? [latestSystem] : [])
-    .map((message) => trimMessage(message.content ?? "", options.maxMessageChars))
+    .map((message) => trimMessage(message.content, options.maxMessageChars))
     .filter(Boolean)
     .join("\n\n");
 
   const lastUserMessage = conversationMessages
     .filter((message) => message.role === "user")
     .at(-1);
-  const skillResolution = lastUserMessage?.content
-    ? resolveSkillCommand(lastUserMessage.content)
-    : null;
+
+  const lastUserText = lastUserMessage ? messageToText(lastUserMessage.content) : "";
+  const skillResolution = lastUserText ? resolveSkillCommand(lastUserText) : null;
 
   const conversationSection = conversationMessages
-    .map((message) => `${message.role}: ${trimMessage(message.content ?? "", options.maxMessageChars)}`)
+    .map((message) => `${message.role}: ${trimMessage(message.content, options.maxMessageChars)}`)
     .join("\n");
 
   const systemParts = [

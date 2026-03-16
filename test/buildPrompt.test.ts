@@ -31,4 +31,45 @@ describe("buildCursorPrompt", () => {
     expect(first).toBeLessThan(second);
     expect(second).toBeLessThan(third);
   });
+
+  it("handles array content correctly by extracting text parts", () => {
+    const prompt = buildCursorPrompt({
+      model: "cursor-agent/default",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "this is some text" },
+            { type: "image_url", image_url: { url: "http://example.com/image.png" } },
+            { type: "text", text: "more text" }
+          ]
+        }
+      ]
+    }, {
+      maxConversationMessages: 10,
+      maxMessageChars: 2000,
+      maxPromptChars: 12000
+    });
+
+    expect(prompt).toContain("user: this is some text\nmore text");
+  });
+
+  it("handles empty assistant messages and null/undefined content", () => {
+    const prompt = buildCursorPrompt({
+      model: "cursor-agent/default",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: null, tool_calls: [] } as any,
+        { role: "user", content: "follow up" }
+      ]
+    }, {
+      maxConversationMessages: 10,
+      maxMessageChars: 2000,
+      maxPromptChars: 12000
+    });
+
+    expect(prompt).toContain("user: hello");
+    expect(prompt).toContain("assistant: ");
+    expect(prompt).toContain("user: follow up");
+  });
 });

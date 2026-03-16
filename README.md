@@ -10,9 +10,10 @@ Local adapter that exposes Cursor Agent CLI as an OpenAI-style chat completion e
 
 - OpenAI-compatible subset endpoints:
   - `GET /health`
+  - `GET /models`
   - `GET /v1/models`
   - `POST /v1/chat/completions`
-- One fake model id: `cursor-agent/default` (configurable)
+- Configurable model aliases, with optional dynamic model discovery from `cursor-agent`
 - Prompt flattening from `messages[]` into a Cursor-ready text block
 - Safe subprocess execution with argument arrays (no shell interpolation)
 - Timeout handling with process termination
@@ -60,6 +61,10 @@ curl http://127.0.0.1:8787/health
 ```
 
 ### Models
+
+```bash
+curl http://127.0.0.1:8787/models
+```
 
 ```bash
 curl http://127.0.0.1:8787/v1/models
@@ -121,6 +126,14 @@ Create or update `~/.config/opencode/opencode.json` with a `cursor` provider ent
 }
 ```
 
+## Dynamic model sync
+
+On startup, the adapter automatically calls `cursor-agent models`, parses the full model list, and writes it into the `provider.cursor.models` block of `~/.config/opencode/opencode.json`. This means OpenCode's model picker will show every model your Cursor account has access to without any manual config.
+
+- Controlled by `CURSOR_DISCOVER_MODELS=true` (default). Set to `false` to disable.
+- If the sync fails for any reason (cursor-agent not found, non-zero exit, etc.), the adapter logs a warning and leaves `opencode.json` untouched — models already configured there remain as the fallback.
+- The sync runs once per adapter boot (not on every request).
+
 ## Current assumptions
 
 - Cursor CLI is callable as a local binary and can run headlessly.
@@ -131,6 +144,11 @@ Create or update `~/.config/opencode/opencode.json` with a `cursor` provider ent
 - Model compatibility can be widened with:
   - `CURSOR_ACCEPT_ANY_MODEL=true` (default)
   - `CURSOR_MODEL_ALIASES=cursor-agent/default,claude-4-6-sonnet`
+- Model forwarding and discovery:
+  - `CURSOR_MODEL_ARG=--model`
+  - `CURSOR_DISCOVER_MODELS=true` (default)
+  - `CURSOR_MODELS_ARGS=models`
+  - `CURSOR_MODELS_CACHE_TTL_MS=300000`
 - For low-latency greetings:
   - `ENABLE_GREETING_FAST_PATH=true` (default)
   - `GREETING_FAST_PATH_RESPONSE=Hi! What can I help you build or debug today?`

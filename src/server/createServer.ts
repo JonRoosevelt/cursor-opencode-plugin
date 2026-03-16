@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import { ZodError } from "zod";
 
 import type { AppConfig } from "../config/config.js";
 import { buildCursorPrompt } from "../cursor/buildPrompt.js";
 import { createCursorChat } from "../cursor/createChat.js";
+import { listCursorModels } from "../cursor/listModels.js";
 import { parseCursorOutput } from "../cursor/parseOutput.js";
 import { runCursor, type RunCursorResult } from "../cursor/runCursor.js";
 import { consumeStreamJsonChunk, createStreamJsonState } from "../cursor/streamJson.js";
@@ -24,6 +25,11 @@ type CreateServerInput = {
 type CacheEntry = {
   expiresAt: number;
   assistantText: string;
+};
+
+type ModelsCacheEntry = {
+  expiresAt: number;
+  modelIds: string[];
 };
 
 const makeChatResponse = (assistantText: string, model: string) => ({
@@ -92,12 +98,36 @@ const resolveWorkingDirectory = (request: ChatCompletionRequest, config: AppConf
   return cwd;
 };
 
-const isModelSupported = (requestedModel: string, config: AppConfig): boolean => {
-  if (config.acceptAnyModel) {
+const isModelSupported = (
+  requestedModel: string,
+  input: { acceptAnyModel: boolean; modelAliases: string[] }
+): boolean => {
+  if (input.acceptAnyModel) {
     return true;
   }
 
-  return config.modelAliases.includes(requestedModel);
+  return input.modelAliases.includes(requestedModel);
+};
+
+const dedupeModelIds = (modelIds: string[]): string[] => {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const modelId of modelIds) {
+    const trimmed = modelId.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    if (seen.has(trimmed)) {
+      continue;
+    }
+
+    seen.add(trimmed);
+    output.push(trimmed);
+  }
+
+  return output;
 };
 
 const getGreetingFastPathResponse = (
@@ -118,7 +148,17 @@ const getGreetingFastPathResponse = (
     return null;
   }
 
-  const normalized = (firstMessage.content ?? "").trim().toLowerCase();
+  const content = firstMessage.content;
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map((part) => (typeof part === "string" ? part : part?.text ?? ""))
+      .join("");
+  }
+
+  const normalized = text.trim().toLowerCase();
   if (!normalized) {
     return null;
   }
@@ -176,12 +216,61 @@ const resolveSessionKey = (
 export const createServer = ({ config }: CreateServerInput): FastifyInstance => {
   const responseCache = new Map<string, CacheEntry>();
   const sessionStore = new SessionStore(config.cursorSessionTtlMs, config.cursorSessionMaxEntries);
-
+  let modelsCache: ModelsCacheEntry | null = null;
   const server = Fastify({
     logger: {
       level: config.logLevel
     }
   });
+  const serializeModelsListResponse = (modelIds: string[]) => ({
+    object: "list",
+    data: modelIds.map((id) => ({
+      id,
+      object: "model",
+      created: 0,
+      owned_by: "local"
+    }))
+  });
+  const resolveAvailableModels = async (logger: FastifyBaseLogger): Promise<string[]> => {
+    const now = Date.now();
+    if (modelsCache && modelsCache.expiresAt > now) {
+      return modelsCache.modelIds;
+    }
+
+    const fallbackModels = dedupeModelIds([config.modelId, ...config.modelAliases]);
+    if (!config.cursorDiscoverModels || config.cursorModelsArgs.length === 0) {
+      modelsCache = {
+        modelIds: fallbackModels,
+        expiresAt: now + config.cursorModelsCacheTtlMs
+      };
+      return fallbackModels;
+    }
+
+    try {
+      const discoveredModels = await listCursorModels(config, config.defaultCwd);
+      const resolvedModels = dedupeModelIds([...discoveredModels, ...fallbackModels]);
+      modelsCache = {
+        modelIds: resolvedModels,
+        expiresAt: now + config.cursorModelsCacheTtlMs
+      };
+      return resolvedModels;
+    } catch (error: unknown) {
+      const adapterError = asAdapterError(error);
+      logger.warn(
+        {
+          code: adapterError.code,
+          statusCode: adapterError.statusCode,
+          details: adapterError.details
+        },
+        "failed to discover cursor models, falling back to configured aliases"
+      );
+      modelsCache = {
+        modelIds: fallbackModels,
+        expiresAt: now + config.cursorModelsCacheTtlMs
+      };
+      return fallbackModels;
+    }
+  };
 
   server.setErrorHandler((error, _request, reply) => {
     const adapterError = asAdapterError(error);
@@ -198,17 +287,11 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
     model: config.modelId
   }));
 
-  server.get("/v1/models", async () => {
-    return {
-      object: "list",
-      data: config.modelAliases.map((id) => ({
-        id,
-        object: "model",
-        created: 0,
-        owned_by: "local"
-      }))
-    };
-  });
+  server.get("/models", async () => serializeModelsListResponse(await resolveAvailableModels(server.log)));
+
+  server.get("/v1/models", async () =>
+    serializeModelsListResponse(await resolveAvailableModels(server.log))
+  );
 
   server.post("/v1/chat/completions", async (request, reply) => {
     const startedAt = Date.now();
@@ -233,10 +316,20 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       throw error;
     }
 
-    if (!isModelSupported(body.model, config)) {
+    let modelIdsForValidation = config.modelAliases;
+    if (!config.acceptAnyModel) {
+      modelIdsForValidation = await resolveAvailableModels(request.log);
+    }
+
+    if (
+      !isModelSupported(body.model, {
+        acceptAnyModel: config.acceptAnyModel,
+        modelAliases: modelIdsForValidation
+      })
+    ) {
       throw new AdapterError(
         "UNKNOWN_MODEL",
-        `Model '${body.model}' is not supported. Supported models: ${config.modelAliases.join(", ")}.`,
+        `Model '${body.model}' is not supported. Supported models: ${modelIdsForValidation.join(", ")}.`,
         400
       );
     }
@@ -357,6 +450,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
           prompt: flattenedPrompt,
           cwd,
           config,
+          model: body.model,
           resumeChatId,
           streamJsonOutput: true,
           onStdoutChunk: (chunk) => {
@@ -392,6 +486,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
               prompt: flattenedPrompt,
               cwd,
               config,
+              model: body.model,
               resumeChatId: freshChatId,
               streamJsonOutput: true,
               onStdoutChunk: (chunk) => {
@@ -524,6 +619,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
         prompt: flattenedPrompt,
         cwd,
         config,
+        model: body.model,
         resumeChatId
       });
     } catch (error: unknown) {
@@ -540,6 +636,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
         prompt: flattenedPrompt,
         cwd,
         config,
+        model: body.model,
         resumeChatId: freshChatId
       });
       resumeChatId = freshChatId;
