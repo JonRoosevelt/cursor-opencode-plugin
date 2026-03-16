@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -61,11 +64,17 @@ const validBody = {
 };
 
 describe("adapter server", () => {
+  const temporaryDirectories: string[] = [];
+
   beforeEach(() => {
     spawnMock.mockReset();
   });
 
   afterEach(() => {
+    for (const temporaryDirectory of temporaryDirectories.splice(0)) {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+
     vi.useRealTimers();
   });
 
@@ -140,6 +149,238 @@ describe("adapter server", () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.choices[0].message.content).toBe("hello from cursor");
+
+    await server.close();
+  });
+
+  it("uses metadata workspacePath as cwd when provided", async () => {
+    const workspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-metadata-"));
+    temporaryDirectories.push(workspaceDirectory);
+
+    spawnMock.mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+      expect(options.cwd).toBe(workspaceDirectory);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "cwd metadata resolution works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        metadata: {
+          workspacePath: workspaceDirectory
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("cwd metadata resolution works");
+
+    await server.close();
+  });
+
+  it("extracts cwd from Workspace Path in message content when metadata is missing", async () => {
+    const workspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-message-"));
+    temporaryDirectories.push(workspaceDirectory);
+
+    spawnMock.mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+      expect(options.cwd).toBe(workspaceDirectory);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "cwd message resolution works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        messages: [
+          {
+            role: "user",
+            content: `<user_info>\nWorkspace Path: ${workspaceDirectory}\n</user_info>\n<user_query>\nexplain this project\n</user_query>`
+          }
+        ]
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("cwd message resolution works");
+
+    await server.close();
+  });
+
+  it("prefers metadata workspacePath over metadata cwd when both are provided", async () => {
+    const metadataWorkspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-preferred-"));
+    temporaryDirectories.push(metadataWorkspaceDirectory);
+
+    spawnMock.mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+      expect(options.cwd).toBe(metadataWorkspaceDirectory);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "preferred workspace path works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        metadata: {
+          cwd: baseConfig.defaultCwd,
+          workspacePath: metadataWorkspaceDirectory
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("preferred workspace path works");
+
+    await server.close();
+  });
+
+  it("uses nested metadata context workspace path when available", async () => {
+    const nestedWorkspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-nested-"));
+    temporaryDirectories.push(nestedWorkspaceDirectory);
+
+    spawnMock.mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+      expect(options.cwd).toBe(nestedWorkspaceDirectory);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "nested workspace path works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        metadata: {
+          context: {
+            workspace: {
+              path: nestedWorkspaceDirectory
+            }
+          }
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("nested workspace path works");
+
+    await server.close();
+  });
+
+  it("extracts absolute repository path from message text without labels", async () => {
+    const messageWorkspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-absolute-path-"));
+    temporaryDirectories.push(messageWorkspaceDirectory);
+
+    spawnMock.mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+      expect(options.cwd).toBe(messageWorkspaceDirectory);
+      const child = new MockChildProcess();
+      setTimeout(() => {
+        child.stdout.emit("data", "absolute path extraction works");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const server = createServer({ config: baseConfig });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        messages: [
+          {
+            role: "user",
+            content: `Please analyze the code in ${messageWorkspaceDirectory} and explain architecture.`
+          }
+        ]
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().choices[0].message.content).toBe("absolute path extraction works");
+
+    await server.close();
+  });
+
+  it("reuses remembered conversation cwd when follow-up request omits path signals", async () => {
+    const rememberedWorkspaceDirectory = mkdtempSync(join(tmpdir(), "adapter-workspace-memory-"));
+    temporaryDirectories.push(rememberedWorkspaceDirectory);
+
+    spawnMock
+      .mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+        expect(options.cwd).toBe(rememberedWorkspaceDirectory);
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "remembered workspace first request");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      })
+      .mockImplementationOnce((_bin: string, _args: string[], options: { cwd: string }) => {
+        expect(options.cwd).toBe(rememberedWorkspaceDirectory);
+        const child = new MockChildProcess();
+        setTimeout(() => {
+          child.stdout.emit("data", "remembered workspace follow-up");
+          child.emit("close", 0);
+        }, 0);
+        return child;
+      });
+
+    const server = createServer({
+      config: {
+        ...baseConfig,
+        responseCacheTtlMs: 0
+      }
+    });
+
+    const firstResponse = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        metadata: {
+          conversationId: "conv-memory",
+          workspacePath: rememberedWorkspaceDirectory
+        }
+      }
+    });
+    expect(firstResponse.statusCode).toBe(200);
+
+    const secondResponse = await server.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      payload: {
+        ...validBody,
+        metadata: {
+          conversationId: "conv-memory"
+        },
+        messages: [{ role: "user", content: "follow up without explicit cwd" }]
+      }
+    });
+    expect(secondResponse.statusCode).toBe(200);
+    expect(secondResponse.json().choices[0].message.content).toBe("remembered workspace follow-up");
 
     await server.close();
   });

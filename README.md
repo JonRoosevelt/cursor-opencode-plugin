@@ -164,6 +164,10 @@ On startup, the adapter automatically calls `cursor-agent models`, parses the fu
   - `CURSOR_SESSION_TTL_MS=1800000`
   - `CURSOR_SESSION_MAX_ENTRIES=500`
   - Include `metadata.conversationId` (or `threadId`/`sessionId`) in request payload
+- Working directory resolution for each request:
+  - First tries request metadata keys like `cwd`, `workspacePath`, `projectPath`, `repoPath`
+  - Then checks equivalent top-level request fields and `x-opencode-cwd`/`x-workspace-path` headers
+  - Finally attempts to extract `Workspace Path: ...` from message text before falling back to `DEFAULT_CWD`
 - If Cursor cannot emit structured output, adapter falls back to trimmed stdout.
 
 ## Tests

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { ServerResponse } from "node:http";
+import { resolve } from "node:path";
 
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import { ZodError } from "zod";
@@ -31,6 +33,17 @@ type ModelsCacheEntry = {
   expiresAt: number;
   modelIds: string[];
 };
+
+const CONVERSATION_ID_CANDIDATE_KEYS = [
+  "conversationId",
+  "conversation_id",
+  "threadId",
+  "thread_id",
+  "sessionId",
+  "session_id",
+  "chatId",
+  "chat_id"
+] as const;
 
 const makeChatResponse = (assistantText: string, model: string) => ({
   id: `chatcmpl-${randomUUID()}`,
@@ -89,13 +102,297 @@ const writeSsePayload = (rawReply: ServerResponse, payload: unknown): void => {
   rawReply.write(`data: ${JSON.stringify(payload)}\n\n`);
 };
 
-const resolveWorkingDirectory = (request: ChatCompletionRequest, config: AppConfig): string => {
-  const cwd = request.metadata?.cwd;
-  if (!cwd || typeof cwd !== "string") {
-    return config.defaultCwd;
+const extractMessageText = (message: ChatCompletionRequest["messages"][number]): string => {
+  const content = message.content;
+  if (typeof content === "string") {
+    return content;
   }
 
-  return cwd;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((part) => (typeof part === "string" ? part : typeof part?.text === "string" ? part.text : ""))
+    .join("\n");
+};
+
+const PREFERRED_WORKING_DIRECTORY_KEYS = [
+  "workspacePath",
+  "workspace_path",
+  "projectPath",
+  "project_path",
+  "repoPath",
+  "repo_path",
+  "root",
+  "rootPath",
+  "root_path"
+] as const;
+
+const CWD_WORKING_DIRECTORY_KEYS = ["cwd", "workingDirectory", "working_directory"] as const;
+
+const PREFERRED_WORKING_DIRECTORY_HEADER_KEYS = [
+  "x-workspace-path",
+  "x-opencode-workspace-path",
+  "x-project-path",
+  "x-repo-path",
+  "x-root-path"
+] as const;
+
+const CWD_WORKING_DIRECTORY_HEADER_KEYS = ["x-opencode-cwd", "x-working-directory", "x-cwd"] as const;
+
+const WORKSPACE_PATH_FROM_MESSAGE_REGEX =
+  /(Workspace|Project|Repo|Root)\s*(?:Path|Directory)?\s*:\s*(.+?)(?:\r?\n|$)/i;
+const CWD_FROM_MESSAGE_REGEX = /\bcwd\s*:\s*(.+?)(?:\r?\n|$)/i;
+const ABSOLUTE_PATH_IN_MESSAGE_REGEX = /(?:^|[\s"'`(])((?:\/[^/\s"'`()<>{}\[\]]+)+)(?=$|[\s"'`),.:;!?])/g;
+
+const normalizeExistingDirectory = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (!existsSync(trimmed)) {
+    return null;
+  }
+
+  return trimmed;
+};
+
+type WorkingDirectoryResolution = {
+  cwd: string;
+  source: string;
+};
+
+type WorkingDirectoryCandidate = {
+  cwd: string;
+  source: string;
+  score: number;
+};
+
+const hasGitDirectory = (cwd: string): boolean => existsSync(resolve(cwd, ".git"));
+
+const scorePathKey = (key: string): number => {
+  const normalized = key.toLowerCase();
+  if (normalized.includes("workspace")) {
+    return 88;
+  }
+
+  if (normalized.includes("project") || normalized.includes("repo") || normalized.includes("root")) {
+    return 82;
+  }
+
+  if (normalized.includes("workingdirectory") || normalized.includes("working_directory")) {
+    return 58;
+  }
+
+  if (normalized === "cwd") {
+    return 50;
+  }
+
+  if (normalized.includes("path")) {
+    return 46;
+  }
+
+  return 40;
+};
+
+const collectNestedPathCandidates = (
+  value: unknown,
+  source: string,
+  pushCandidate: (raw: unknown, source: string, score: number) => void
+): void => {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const queue: Array<{ value: unknown; source: string; depth: number }> = [
+    { value, source, depth: 0 }
+  ];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    if (!current.value || typeof current.value !== "object") {
+      continue;
+    }
+
+    if (current.depth >= 4) {
+      continue;
+    }
+
+    if (Array.isArray(current.value)) {
+      for (let index = 0; index < current.value.length; index += 1) {
+        queue.push({
+          value: current.value[index],
+          source: `${current.source}[${index}]`,
+          depth: current.depth + 1
+        });
+      }
+      continue;
+    }
+
+    for (const [key, nestedValue] of Object.entries(current.value as Record<string, unknown>)) {
+      const nestedSource = `${current.source}.${key}`;
+      if (typeof nestedValue === "string") {
+        const looksPathLike =
+          key.toLowerCase().includes("path") ||
+          key.toLowerCase().includes("cwd") ||
+          key.toLowerCase().includes("workspace") ||
+          key.toLowerCase().includes("project") ||
+          key.toLowerCase().includes("repo") ||
+          key.toLowerCase().includes("root");
+        if (looksPathLike) {
+          pushCandidate(nestedValue, nestedSource, scorePathKey(key));
+        }
+      }
+
+      if (!nestedValue || typeof nestedValue !== "object") {
+        continue;
+      }
+
+      queue.push({
+        value: nestedValue,
+        source: nestedSource,
+        depth: current.depth + 1
+      });
+    }
+  }
+};
+
+const collectMessagePathCandidates = (
+  messageText: string,
+  pushCandidate: (raw: unknown, source: string, score: number) => void
+): void => {
+  ABSOLUTE_PATH_IN_MESSAGE_REGEX.lastIndex = 0;
+  let pathMatch = ABSOLUTE_PATH_IN_MESSAGE_REGEX.exec(messageText);
+  while (pathMatch) {
+    pushCandidate(pathMatch[1], "message.absolutePath", 70);
+    pathMatch = ABSOLUTE_PATH_IN_MESSAGE_REGEX.exec(messageText);
+  }
+};
+
+const resolveWorkingDirectory = (
+  body: ChatCompletionRequest,
+  headers: Record<string, string | string[] | undefined>,
+  config: AppConfig,
+  rememberedConversationCwd: string | null
+): WorkingDirectoryResolution => {
+  const candidates: WorkingDirectoryCandidate[] = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (raw: unknown, source: string, score: number): void => {
+    const normalized = normalizeExistingDirectory(raw);
+    if (!normalized) {
+      return;
+    }
+
+    if (seen.has(`${source}:${normalized}`)) {
+      return;
+    }
+
+    const gitBoost = hasGitDirectory(normalized) ? 5 : 0;
+    const defaultCwdPenalty = normalized === config.defaultCwd ? -3 : 0;
+    seen.add(`${source}:${normalized}`);
+    candidates.push({
+      cwd: normalized,
+      source,
+      score: score + gitBoost + defaultCwdPenalty
+    });
+  };
+
+  for (const key of PREFERRED_WORKING_DIRECTORY_KEYS) {
+    pushCandidate(body.metadata?.[key], `metadata.${key}`, 100);
+  }
+
+  for (const key of CWD_WORKING_DIRECTORY_KEYS) {
+    pushCandidate(body.metadata?.[key], `metadata.${key}`, 60);
+  }
+
+  if (rememberedConversationCwd) {
+    pushCandidate(rememberedConversationCwd, "conversationMemory", 80);
+  }
+
+  collectNestedPathCandidates(body.metadata, "metadata", pushCandidate);
+
+  for (const key of PREFERRED_WORKING_DIRECTORY_KEYS) {
+    pushCandidate((body as Record<string, unknown>)[key], `body.${key}`, 95);
+  }
+
+  for (const key of CWD_WORKING_DIRECTORY_KEYS) {
+    pushCandidate((body as Record<string, unknown>)[key], `body.${key}`, 55);
+  }
+
+  collectNestedPathCandidates(body, "body", pushCandidate);
+
+  for (const headerName of PREFERRED_WORKING_DIRECTORY_HEADER_KEYS) {
+    const rawHeader = headers[headerName];
+    const headerValue = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+    pushCandidate(headerValue, `header.${headerName}`, 90);
+  }
+
+  for (const headerName of CWD_WORKING_DIRECTORY_HEADER_KEYS) {
+    const rawHeader = headers[headerName];
+    const headerValue = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+    pushCandidate(headerValue, `header.${headerName}`, 50);
+  }
+
+  for (const message of body.messages) {
+    const messageText = extractMessageText(message);
+    if (!messageText) {
+      continue;
+    }
+
+    const workspaceMatch = messageText.match(WORKSPACE_PATH_FROM_MESSAGE_REGEX);
+    if (workspaceMatch) {
+      pushCandidate(workspaceMatch[2], "message.workspacePath", 85);
+    }
+
+    const cwdMatch = messageText.match(CWD_FROM_MESSAGE_REGEX);
+    if (cwdMatch) {
+      pushCandidate(cwdMatch[1], "message.cwd", 45);
+    }
+
+    collectMessagePathCandidates(messageText, pushCandidate);
+  }
+
+  if (candidates.length === 0) {
+    return {
+      cwd: config.defaultCwd,
+      source: "defaultCwd"
+    };
+  }
+
+  candidates.sort((left, right) => right.score - left.score);
+  return {
+    cwd: candidates[0].cwd,
+    source: candidates[0].source
+  };
+};
+
+const resolveConversationId = (request: ChatCompletionRequest): string | null => {
+  const metadata = request.metadata;
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+
+  for (const candidate of CONVERSATION_ID_CANDIDATE_KEYS) {
+    const value = metadata[candidate];
+    if (typeof value !== "string" || !value.trim()) {
+      continue;
+    }
+
+    return value.trim();
+  }
+
+  return null;
 };
 
 const isModelSupported = (
@@ -183,27 +480,9 @@ const resolveSessionKey = (
     return null;
   }
 
-  const metadata = request.metadata;
-  if (metadata && typeof metadata === "object") {
-    const candidates = [
-      "conversationId",
-      "conversation_id",
-      "threadId",
-      "thread_id",
-      "sessionId",
-      "session_id",
-      "chatId",
-      "chat_id"
-    ] as const;
-
-    for (const candidate of candidates) {
-      const value = metadata[candidate];
-      if (typeof value !== "string" || !value.trim()) {
-        continue;
-      }
-
-      return `${cwd}:${value.trim()}`;
-    }
+  const conversationId = resolveConversationId(request);
+  if (conversationId) {
+    return `${cwd}:${conversationId}`;
   }
 
   if (config.cursorSessionFallbackToCwd) {
@@ -216,6 +495,10 @@ const resolveSessionKey = (
 export const createServer = ({ config }: CreateServerInput): FastifyInstance => {
   const responseCache = new Map<string, CacheEntry>();
   const sessionStore = new SessionStore(config.cursorSessionTtlMs, config.cursorSessionMaxEntries);
+  const conversationCwdStore = new SessionStore(
+    config.cursorSessionTtlMs,
+    config.cursorSessionMaxEntries * 2
+  );
   let modelsCache: ModelsCacheEntry | null = null;
   const server = Fastify({
     logger: {
@@ -334,7 +617,18 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       );
     }
 
-    const cwd = resolveWorkingDirectory(body, config);
+    const conversationId = resolveConversationId(body);
+    const rememberedConversationCwd = conversationId ? conversationCwdStore.get(conversationId) : null;
+    const cwdResolution = resolveWorkingDirectory(
+      body,
+      request.headers,
+      config,
+      rememberedConversationCwd
+    );
+    const cwd = cwdResolution.cwd;
+    if (conversationId && cwdResolution.source !== "defaultCwd") {
+      conversationCwdStore.set(conversationId, cwd);
+    }
     const sessionKey = resolveSessionKey(body, cwd, config);
     const flattenedPrompt = buildCursorPrompt(body, {
       maxConversationMessages: config.promptMaxConversationMessages,
@@ -407,11 +701,23 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       {
         model: body.model,
         cwd,
+        cwdSource: cwdResolution.source,
         messageCount: body.messages.length,
         hasSessionKey: Boolean(sessionKey)
       },
       "handling chat completion request"
     );
+    if (cwdResolution.source === "defaultCwd") {
+      request.log.warn(
+        {
+          metadataKeys:
+            body.metadata && typeof body.metadata === "object" ? Object.keys(body.metadata).slice(0, 20) : [],
+          requestTopLevelKeys: Object.keys(body).slice(0, 20),
+          headerKeys: Object.keys(request.headers).slice(0, 20)
+        },
+        "no request workspace path signal found; using default cwd"
+      );
+    }
 
     let resumeChatId: string | undefined;
     let sessionChatIdToPersist: string | null = null;
