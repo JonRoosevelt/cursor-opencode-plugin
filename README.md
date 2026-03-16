@@ -124,8 +124,7 @@ Create or update `~/.config/opencode/opencode.json` with a `cursor` provider ent
 ## Current assumptions
 
 - Cursor CLI is callable as a local binary and can run headlessly.
-- True token-level streaming is not available in `v0.1.0` due to current `cursor-agent` behavior.
-- When `stream=true`, the adapter returns SSE-shaped output after Cursor finishes (pseudo-stream), not live token deltas.
+- For `stream=true`, the adapter requests Cursor stream output (`--output-format stream-json --print`) and forwards incremental SSE chunks as they arrive.
 - Prompt delivery mode may differ by Cursor version; use:
   - `CURSOR_PROMPT_MODE=stdin` (default), or
   - `CURSOR_PROMPT_MODE=arg` with `CURSOR_PROMPT_ARG`.

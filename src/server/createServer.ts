@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ServerResponse } from "node:http";
 
 import Fastify, { type FastifyInstance } from "fastify";
 import { ZodError } from "zod";
@@ -7,7 +8,8 @@ import type { AppConfig } from "../config/config.js";
 import { buildCursorPrompt } from "../cursor/buildPrompt.js";
 import { createCursorChat } from "../cursor/createChat.js";
 import { parseCursorOutput } from "../cursor/parseOutput.js";
-import { runCursor } from "../cursor/runCursor.js";
+import { runCursor, type RunCursorResult } from "../cursor/runCursor.js";
+import { consumeStreamJsonChunk, createStreamJsonState } from "../cursor/streamJson.js";
 import { AdapterError, asAdapterError } from "../errors/adapterError.js";
 import {
   type ChatCompletionRequest,
@@ -75,6 +77,10 @@ const makeSseChatPayload = (assistantText: string, model: string): string => {
 
   const serializedEvents = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
   return `${serializedEvents}data: [DONE]\n\n`;
+};
+
+const writeSsePayload = (rawReply: ServerResponse, payload: unknown): void => {
+  rawReply.write(`data: ${JSON.stringify(payload)}\n\n`);
 };
 
 const resolveWorkingDirectory = (request: ChatCompletionRequest, config: AppConfig): string => {
@@ -321,6 +327,164 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
       }
     }
 
+    if (body.stream) {
+      const completionId = `chatcmpl-${randomUUID()}`;
+      const streamState = createStreamJsonState();
+      const assistantParts: string[] = [];
+
+      reply.hijack();
+      reply.raw.statusCode = 200;
+      reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      reply.raw.setHeader("Cache-Control", "no-cache");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.setHeader("x-adapter-cache", "miss");
+      reply.raw.setHeader("x-adapter-session", sessionKey ? "on" : "off");
+      writeSsePayload(
+        reply.raw,
+        makeStreamChunk(completionId, body.model, { role: "assistant" }, null)
+      );
+
+      let streamResult: RunCursorResult | null = null;
+      try {
+        streamResult = await runCursor({
+          prompt: flattenedPrompt,
+          cwd,
+          config,
+          resumeChatId,
+          streamJsonOutput: true,
+          onStdoutChunk: (chunk) => {
+            const assistantChunks = consumeStreamJsonChunk(streamState, chunk);
+            if (assistantChunks.length === 0) {
+              return;
+            }
+
+            for (const assistantChunk of assistantChunks) {
+              assistantParts.push(assistantChunk);
+              writeSsePayload(
+                reply.raw,
+                makeStreamChunk(completionId, body.model, { content: assistantChunk }, null)
+              );
+            }
+          }
+        });
+      } catch (error: unknown) {
+        const adapterError = asAdapterError(error);
+        const canRetryWithFreshSession =
+          adapterError.code === "CURSOR_NON_ZERO_EXIT" &&
+          Boolean(sessionKey && resumeChatId) &&
+          assistantParts.length === 0;
+        if (canRetryWithFreshSession && sessionKey) {
+          sessionStore.delete(sessionKey);
+          const freshChatId = await createCursorChat(config, cwd);
+          sessionStore.set(sessionKey, freshChatId);
+
+          streamResult = await runCursor({
+            prompt: flattenedPrompt,
+            cwd,
+            config,
+            resumeChatId: freshChatId,
+            streamJsonOutput: true,
+            onStdoutChunk: (chunk) => {
+              const assistantChunks = consumeStreamJsonChunk(streamState, chunk);
+              if (assistantChunks.length === 0) {
+                return;
+              }
+
+              for (const assistantChunk of assistantChunks) {
+                assistantParts.push(assistantChunk);
+                writeSsePayload(
+                  reply.raw,
+                  makeStreamChunk(completionId, body.model, { content: assistantChunk }, null)
+                );
+              }
+            }
+          });
+
+          resumeChatId = freshChatId;
+        } else {
+          request.log.error(
+            {
+              code: adapterError.code,
+              statusCode: adapterError.statusCode,
+              details: adapterError.details
+            },
+            "cursor streamed request failed"
+          );
+          writeSsePayload(reply.raw, {
+            error: {
+              code: adapterError.code,
+              message: adapterError.message
+            }
+          });
+          reply.raw.write("data: [DONE]\n\n");
+          reply.raw.end();
+          return;
+        }
+      }
+
+      if (!streamResult) {
+        request.log.error(
+          {
+            model: body.model,
+            cwd
+          },
+          "stream result missing unexpectedly"
+        );
+        writeSsePayload(reply.raw, {
+          error: {
+            code: "INTERNAL_ERROR",
+            message: "Unexpected internal error."
+          }
+        });
+        reply.raw.write("data: [DONE]\n\n");
+        reply.raw.end();
+        return;
+      }
+
+      if (assistantParts.length === 0) {
+        const fallbackText = parseCursorOutput(streamResult.stdout, streamResult.stderr);
+        assistantParts.push(fallbackText);
+        writeSsePayload(
+          reply.raw,
+          makeStreamChunk(completionId, body.model, { content: fallbackText }, null)
+        );
+      }
+
+      const assistantText = assistantParts.join("");
+      if (config.responseCacheTtlMs > 0) {
+        if (responseCache.size >= config.responseCacheMaxEntries) {
+          const firstKey = responseCache.keys().next().value;
+          if (firstKey) {
+            responseCache.delete(firstKey);
+          }
+        }
+
+        responseCache.set(cacheKey, {
+          assistantText,
+          expiresAt: Date.now() + config.responseCacheTtlMs
+        });
+      }
+
+      request.log.info(
+        {
+          requestId: streamResult.requestId,
+          exitCode: streamResult.exitCode,
+          durationMs: streamResult.durationMs,
+          outputLength: assistantText.length,
+          usedSession: Boolean(resumeChatId),
+          streamJson: true
+        },
+        "cursor streamed request completed"
+      );
+
+      const durationMs = Date.now() - startedAt;
+      request.log.debug({ durationMs }, "stream response duration");
+      writeSsePayload(reply.raw, makeStreamChunk(completionId, body.model, {}, "stop"));
+      reply.raw.write("data: [DONE]\n\n");
+      reply.raw.end();
+      return;
+    }
+
     let cursorResult;
     try {
       cursorResult = await runCursor({
@@ -378,17 +542,7 @@ export const createServer = ({ config }: CreateServerInput): FastifyInstance => 
     reply.header("x-adapter-duration-ms", String(durationMs));
     reply.header("x-adapter-cache", "miss");
     reply.header("x-adapter-session", sessionKey ? "on" : "off");
-    if (!body.stream) {
-      reply.status(200).send(makeChatResponse(assistantText, body.model));
-      return;
-    }
-
-    reply
-      .status(200)
-      .header("Content-Type", "text/event-stream; charset=utf-8")
-      .header("Cache-Control", "no-cache")
-      .header("Connection", "keep-alive")
-      .send(makeSseChatPayload(assistantText, body.model));
+    reply.status(200).send(makeChatResponse(assistantText, body.model));
   });
 
   return server;

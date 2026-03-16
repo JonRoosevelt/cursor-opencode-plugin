@@ -9,9 +9,12 @@ type RunCursorInput = {
   cwd: string;
   config: AppConfig;
   resumeChatId?: string;
+  streamJsonOutput?: boolean;
+  onStdoutChunk?: (chunk: string) => void;
+  onStderrChunk?: (chunk: string) => void;
 };
 
-type RunCursorResult = {
+export type RunCursorResult = {
   requestId: string;
   stdout: string;
   stderr: string;
@@ -32,7 +35,10 @@ export const runCursor = ({
   prompt,
   cwd,
   config,
-  resumeChatId
+  resumeChatId,
+  streamJsonOutput,
+  onStdoutChunk,
+  onStderrChunk
 }: RunCursorInput): Promise<RunCursorResult> =>
   new Promise((resolve, reject) => {
     const requestId = randomUUID();
@@ -41,6 +47,10 @@ export const runCursor = ({
 
     if (resumeChatId) {
       args.push("--resume", resumeChatId);
+    }
+
+    if (streamJsonOutput) {
+      args.push("--output-format", "stream-json", "--stream-partial-output", "--print");
     }
 
     if (config.cursorPromptMode === "arg") {
@@ -110,12 +120,16 @@ export const runCursor = ({
     });
 
     child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout += chunk.toString();
+      const outputChunk = chunk.toString();
+      onStdoutChunk?.(outputChunk);
+      stdout += outputChunk;
       stdout = truncateToBytes(stdout, config.maxStdoutBytes);
     });
 
     child.stderr.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
+      const errorChunk = chunk.toString();
+      onStderrChunk?.(errorChunk);
+      stderr += errorChunk;
       stderr = truncateToBytes(stderr, config.maxStdoutBytes);
     });
 

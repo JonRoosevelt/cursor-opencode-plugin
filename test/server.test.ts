@@ -182,11 +182,15 @@ describe("adapter server", () => {
     await server.close();
   });
 
-  it("returns event-stream payload when stream is true", async () => {
-    spawnMock.mockImplementationOnce(() => {
+  it("streams incremental SSE chunks using cursor stream-json output", async () => {
+    spawnMock.mockImplementationOnce((_bin: string, args: string[]) => {
+      expect(args).toContain("--output-format");
+      expect(args).toContain("stream-json");
+      expect(args).toContain("--print");
       const child = new MockChildProcess();
       setTimeout(() => {
-        child.stdout.emit("data", "streamed answer");
+        child.stdout.emit("data", '{"choices":[{"delta":{"content":"streamed "}}]}\n');
+        child.stdout.emit("data", '{"choices":[{"delta":{"content":"answer"}}]}\n');
         child.emit("close", 0);
       }, 0);
       return child;
@@ -205,7 +209,8 @@ describe("adapter server", () => {
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toContain("text/event-stream");
     expect(response.body).toContain('"object":"chat.completion.chunk"');
-    expect(response.body).toContain("streamed answer");
+    expect(response.body).toContain('"content":"streamed "');
+    expect(response.body).toContain('"content":"answer"');
     expect(response.body).toContain("data: [DONE]");
 
     await server.close();
