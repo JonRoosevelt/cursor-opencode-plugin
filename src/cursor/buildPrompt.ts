@@ -1,4 +1,5 @@
 import type { ChatCompletionRequest } from "../providers/openaiSchemas.js";
+import { resolveSkillCommand } from "./resolveSkillCommand.js";
 
 const normalizeContent = (value: string): string => value.replace(/\r\n/g, "\n").trim();
 
@@ -38,23 +39,37 @@ export const buildCursorPrompt = (
     .slice(-options.maxConversationMessages);
 
   const systemSection = (latestSystem ? [latestSystem] : [])
-    .map((message) => trimMessage(message.content, options.maxMessageChars))
+    .map((message) => trimMessage(message.content ?? "", options.maxMessageChars))
     .filter(Boolean)
     .join("\n\n");
 
+  const lastUserMessage = conversationMessages
+    .filter((message) => message.role === "user")
+    .at(-1);
+  const skillResolution = lastUserMessage?.content
+    ? resolveSkillCommand(lastUserMessage.content)
+    : null;
+
   const conversationSection = conversationMessages
-    .map((message) => `${message.role}: ${trimMessage(message.content, options.maxMessageChars)}`)
+    .map((message) => `${message.role}: ${trimMessage(message.content ?? "", options.maxMessageChars)}`)
     .join("\n");
 
-  const prompt = [
+  const systemParts = [
     "[SYSTEM]",
     "You are being called through an adapter from OpenCode.",
     "Return only the final assistant response with no surrounding metadata.",
-    systemSection || "(no explicit system message)",
-    "",
-    "[CONVERSATION]",
-    conversationSection
-  ].join("\n");
+    systemSection || "(no explicit system message)"
+  ];
+
+  if (skillResolution) {
+    systemParts.push(
+      "",
+      `[SKILL INSTRUCTIONS: /${skillResolution.commandName}]`,
+      skillResolution.content
+    );
+  }
+
+  const prompt = [...systemParts, "", "[CONVERSATION]", conversationSection].join("\n");
 
   return trimPrompt(prompt, options.maxPromptChars);
 };

@@ -118,7 +118,7 @@ const getGreetingFastPathResponse = (
     return null;
   }
 
-  const normalized = firstMessage.content.trim().toLowerCase();
+  const normalized = (firstMessage.content ?? "").trim().toLowerCase();
   if (!normalized) {
     return null;
   }
